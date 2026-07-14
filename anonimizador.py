@@ -363,16 +363,30 @@ CSS_EXECUTIVO = """
         padding: 16px 20px;
         box-shadow: 0 2px 12px rgba(0,0,0,0.07);
     }
-    .stTabs [data-baseweb="tab-list"] { gap: 6px; }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px;
+        border-bottom: none;
+    }
     .stTabs [data-baseweb="tab"] {
-        border-radius: 10px 10px 0 0;
-        padding: 10px 20px;
+        border-radius: 999px;
+        padding: 10px 26px;
         background-color: #E8ECF3;
+        color: #0B1F3A;
         font-weight: 600;
+        border: none;
     }
     .stTabs [aria-selected="true"] {
-        background-color: white;
-        color: #0B1F3A;
+        background-color: #0B1F3A;
+        box-shadow: 0 2px 10px rgba(11, 31, 58, 0.3);
+    }
+    .stTabs [aria-selected="true"] p {
+        color: white !important;
+    }
+    .stTabs [data-baseweb="tab-highlight"] {
+        background-color: transparent;
+    }
+    .stTabs [data-baseweb="tab-border"] {
+        display: none;
     }
     header[data-testid="stHeader"] {
         background-color: transparent;
@@ -424,16 +438,12 @@ aba_anonimizar, aba_desanonimizar = st.tabs(["🔒 Anonimizar", "🔓 Desanonimi
 
 with aba_anonimizar:
     with st.container(border=True):
-        arquivo_mapa_anterior = st.file_uploader(
-            "Mapeamento anterior (opcional, para manter os mesmos códigos entre execuções)",
-            type="csv", key="mapa_anterior_anon",
-        )
         arquivo = st.file_uploader("Arquivo CSV para anonimizar", type=["csv", "txt"], key="upload_anon")
 
         if arquivo is not None:
             st.caption(f"📄 {arquivo.name} — {arquivo.size / 1_048_576:.1f} MB")
             if st.button("▶️ Iniciar anonimização", type="primary", key="btn_anon"):
-                processar_anonimizacao(arquivo, separador, encoding, arquivo_mapa_anterior)
+                processar_anonimizacao(arquivo, separador, encoding, None)
 
     if "resultado_anon" in st.session_state:
         resultado = st.session_state["resultado_anon"]

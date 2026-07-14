@@ -363,30 +363,32 @@ CSS_EXECUTIVO = """
         padding: 16px 20px;
         box-shadow: 0 2px 12px rgba(0,0,0,0.07);
     }
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 10px;
-        border-bottom: none;
-    }
-    .stTabs [data-baseweb="tab"] {
-        border-radius: 999px;
-        padding: 10px 26px;
-        background-color: #E8ECF3;
-        color: #0B1F3A;
-        font-weight: 600;
-        border: none;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #0B1F3A;
-        box-shadow: 0 2px 10px rgba(11, 31, 58, 0.3);
-    }
-    .stTabs [aria-selected="true"] p {
-        color: white !important;
-    }
-    .stTabs [data-baseweb="tab-highlight"] {
-        background-color: transparent;
-    }
+    .stTabs [data-baseweb="tab-highlight"],
     .stTabs [data-baseweb="tab-border"] {
-        display: none;
+        display: none !important;
+    }
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 10px !important;
+        border-bottom: none !important;
+    }
+    .stTabs button[data-baseweb="tab"] {
+        border-radius: 999px !important;
+        padding: 10px 26px !important;
+        background-color: #E8ECF3 !important;
+        border: none !important;
+        box-shadow: none !important;
+        transition: all 0.15s ease !important;
+    }
+    .stTabs button[data-baseweb="tab"] p {
+        color: #0B1F3A !important;
+        font-weight: 600 !important;
+    }
+    .stTabs button[aria-selected="true"] {
+        background-color: #0B1F3A !important;
+        box-shadow: 0 3px 10px rgba(11, 31, 58, 0.35) !important;
+    }
+    .stTabs button[aria-selected="true"] p {
+        color: white !important;
     }
     header[data-testid="stHeader"] {
         background-color: transparent;

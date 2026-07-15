@@ -47,7 +47,7 @@ COLUNAS_ALVO = {
         "aliases": [
             "sku", "nome sku", "cod sku", "codigo sku", "descricao sku",
             "produto", "nome produto", "descricao produto", "descricao",
-            "nome do produto", "item", "nome item", "nome do item",
+            "nome do produto", "item", "nome item", "nome do item", "nombre sku"
         ],
     },
     5: {

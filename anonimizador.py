@@ -8,12 +8,14 @@ tudo na memória de uma vez.
 """
 
 import os
+import re
 import time
 import tempfile
 
 import pandas as pd
 import streamlit as st
 import unicodedata
+from charset_normalizer import from_bytes
 
 # ---------------------------------------------------------------------------
 # Configuração
@@ -21,12 +23,41 @@ import unicodedata
 CHUNK_SIZE = 200_000  # linhas processadas por bloco
 
 COLUNAS_ALVO = {
-    1: {"nome": "fornecedor", "aliases": ["fornecedor", "fabricante", "proveedor", "supplier", "manufacturer"]},
-    2: {"nome": "ean", "aliases": ["ean", "codigo_ean", "codigo_barras", "codigo de barras"]},
-    3: {"nome": "marca", "aliases": ["marca", "brand"]},
-    4: {"nome": "sku", "aliases": ["sku", "produto", "descricao", "nome_produto", "nombre_sku"]},
-    5: {"nome": "canal", "aliases": ["canal", "channel", "pdv_canal"]},
-    6: {"nome": "uf", "aliases": ["uf", "estado", "state"]},
+    1: {
+        "nome": "fornecedor",
+        "aliases": [
+            "fornecedor", "fabricante", "proveedor", "supplier", "manufacturer",
+            "nome fornecedor", "razao social fornecedor", "razao social",
+            "nome fabricante", "cod fornecedor", "codigo fornecedor",
+        ],
+    },
+    2: {
+        "nome": "ean",
+        "aliases": [
+            "ean", "codigo ean", "cod ean", "codigo de barras", "codigo barras",
+            "barcode", "gtin", "nome ean",
+        ],
+    },
+    3: {
+        "nome": "marca",
+        "aliases": ["marca", "brand", "nome marca"],
+    },
+    4: {
+        "nome": "sku",
+        "aliases": [
+            "sku", "nome sku", "cod sku", "codigo sku", "descricao sku",
+            "produto", "nome produto", "descricao produto", "descricao",
+            "nome do produto", "item", "nome item", "nome do item",
+        ],
+    },
+    5: {
+        "nome": "canal",
+        "aliases": ["canal", "channel", "pdv canal", "tipo canal"],
+    },
+    6: {
+        "nome": "uf",
+        "aliases": ["uf", "estado", "state", "unidade federativa"],
+    },
 }
 BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 
@@ -52,15 +83,51 @@ def padronizar_canal(valor):
     return v
 
 
+def normalizar_chave(texto):
+    """Remove acento, minusculiza e tira espaço/underscore/hífen/pontuação
+    -- assim 'Nome SKU', 'nome_sku' e 'Nome-Sku' todos virem 'nomesku' e
+    casam entre si, independente de como a coluna foi escrita."""
+    texto = normalizar(texto)
+    return re.sub(r"[^a-z0-9]", "", texto)
+
+
 def identificar_colunas(colunas_arquivo):
-    """Casa colunas do arquivo com colunas-alvo pelo nome normalizado."""
+    """Casa colunas do arquivo com colunas-alvo. Primeiro tenta um match
+    exato (ignorando espaço/acento/maiúscula); se não achar, cai para um
+    fallback por substring (só com aliases de 4+ caracteres, pra não dar
+    falso positivo com termos curtos como 'uf')."""
+    aliases_por_indice = {
+        indice: [normalizar_chave(a) for a in info["aliases"]]
+        for indice, info in COLUNAS_ALVO.items()
+    }
+    todos_aliases = sorted(
+        (
+            (alias, indice)
+            for indice, aliases in aliases_por_indice.items()
+            for alias in aliases
+        ),
+        key=lambda x: -len(x[0]),
+    )
+
     encontradas = {}
     for coluna in colunas_arquivo:
-        col_norm = normalizar(coluna)
-        for indice, info in COLUNAS_ALVO.items():
-            if col_norm in [normalizar(a) for a in info["aliases"]]:
-                encontradas[coluna] = indice
+        col_norm = normalizar_chave(coluna)
+        indice_encontrado = None
+
+        for indice, aliases in aliases_por_indice.items():
+            if col_norm in aliases:
+                indice_encontrado = indice
                 break
+
+        if indice_encontrado is None:
+            for alias, indice in todos_aliases:
+                if len(alias) >= 4 and alias in col_norm:
+                    indice_encontrado = indice
+                    break
+
+        if indice_encontrado is not None:
+            encontradas[coluna] = indice_encontrado
+
     return encontradas
 
 
@@ -163,18 +230,63 @@ def formatar_tempo(segundos):
     h, m = divmod(m, 60)
     return f"{h}h{m:02d}m"
 
+def detectar_encoding(arquivo, tamanho_amostra=200_000):
+    """Detecta automaticamente a codificação do arquivo a partir de uma
+    amostra dos bytes -- evita ficar testando utf-8/latin-1/cp1252 na mão."""
+    arquivo.seek(0)
+    amostra = arquivo.read(tamanho_amostra)
+    arquivo.seek(0)
+    resultado = from_bytes(amostra).best()
+    return resultado.encoding if resultado else "utf-8-sig"
+
+
+def eh_excel(arquivo):
+    return arquivo.name.lower().endswith((".xlsx", ".xls"))
+
+
+def ler_colunas_amostra(arquivo, sep, encoding):
+    arquivo.seek(0)
+    if eh_excel(arquivo):
+        amostra = pd.read_excel(arquivo, nrows=1000, dtype=str)
+    else:
+        amostra = pd.read_csv(arquivo, sep=sep, encoding=encoding, nrows=1000, dtype=str)
+    arquivo.seek(0)
+    return amostra.columns
+
+
+def ler_em_blocos(arquivo, sep, encoding):
+    """Gera blocos do arquivo. CSV/TXT: em blocos reais (leve na memória,
+    sustenta 600MB+). Excel: lido de uma vez só, já que o pandas não tem
+    leitura em blocos nativa para xlsx -- para arquivos MUITO grandes,
+    prefira CSV."""
+    if eh_excel(arquivo):
+        yield pd.read_excel(arquivo, dtype=str)
+    else:
+        leitor = pd.read_csv(
+            arquivo, sep=sep, encoding=encoding, chunksize=CHUNK_SIZE,
+            dtype=str, keep_default_na=False
+        )
+        for chunk in leitor:
+            yield chunk
+
 
 # ---------------------------------------------------------------------------
 # Processamento: anonimização
 # ---------------------------------------------------------------------------
-def processar_anonimizacao(arquivo, sep, encoding, arquivo_mapa_anterior):
+def processar_anonimizacao(arquivo, sep, encoding_manual, arquivo_mapa_anterior):
     tamanho_total = arquivo.size
     mapas, proximo_seq = carregar_mapa(arquivo_mapa_anterior)
 
-    arquivo.seek(0)
-    amostra = pd.read_csv(arquivo, sep=sep, encoding=encoding, nrows=1000, dtype=str)
-    colunas_alvo = identificar_colunas(amostra.columns)
-    arquivo.seek(0)
+    if eh_excel(arquivo):
+        encoding = None
+    elif encoding_manual == "Automático":
+        encoding = detectar_encoding(arquivo)
+        st.caption(f"🔎 Codificação detectada automaticamente: **{encoding}**")
+    else:
+        encoding = encoding_manual
+
+    colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
+    colunas_alvo = identificar_colunas(colunas_arquivo)
 
     if not colunas_alvo:
         st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) foi encontrada no arquivo.")
@@ -189,16 +301,11 @@ def processar_anonimizacao(arquivo, sep, encoding, arquivo_mapa_anterior):
     barra = st.progress(0.0)
     inicio = time.time()
 
-    saida_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
+    saida_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline="")
     linhas_processadas = 0
     primeiro_chunk = True
 
-    leitor = pd.read_csv(
-        arquivo, sep=sep, encoding=encoding, chunksize=CHUNK_SIZE,
-        dtype=str, keep_default_na=False
-    )
-
-    for chunk in leitor:
+    for chunk in ler_em_blocos(arquivo, sep, encoding):
         for coluna, indice in colunas_alvo.items():
             chunk[coluna], _ = anonimizar_coluna(chunk[coluna], indice, mapas, proximo_seq)
 
@@ -229,7 +336,7 @@ def processar_anonimizacao(arquivo, sep, encoding, arquivo_mapa_anterior):
 # ---------------------------------------------------------------------------
 # Processamento: desanonimização
 # ---------------------------------------------------------------------------
-def processar_desanonimizacao(arquivo, sep, encoding, arquivo_mapa):
+def processar_desanonimizacao(arquivo, sep, encoding_manual, arquivo_mapa):
     if arquivo_mapa is None:
         st.warning("Envie o arquivo de mapeamento (referência) para desanonimizar.")
         return
@@ -241,15 +348,21 @@ def processar_desanonimizacao(arquivo, sep, encoding, arquivo_mapa):
         for coluna, grupo in df_mapa.groupby("coluna")
     }
 
-    arquivo.seek(0)
-    amostra = pd.read_csv(arquivo, sep=sep, encoding=encoding, nrows=1000, dtype=str)
-    colunas_no_arquivo = identificar_colunas(amostra.columns)
+    if eh_excel(arquivo):
+        encoding = None
+    elif encoding_manual == "Automático":
+        encoding = detectar_encoding(arquivo)
+        st.caption(f"🔎 Codificação detectada automaticamente: **{encoding}**")
+    else:
+        encoding = encoding_manual
+
+    colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
+    colunas_no_arquivo = identificar_colunas(colunas_arquivo)
     colunas_para_restaurar = {
         col: COLUNAS_ALVO[idx]["nome"]
         for col, idx in colunas_no_arquivo.items()
         if COLUNAS_ALVO[idx]["nome"] in mapa_reverso
     }
-    arquivo.seek(0)
 
     if not colunas_para_restaurar:
         st.warning("Nenhuma coluna do arquivo bate com o mapeamento enviado.")
@@ -261,16 +374,11 @@ def processar_desanonimizacao(arquivo, sep, encoding, arquivo_mapa):
     barra = st.progress(0.0)
     inicio = time.time()
 
-    saida_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8", newline="")
+    saida_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline="")
     linhas_processadas = 0
     primeiro_chunk = True
 
-    leitor = pd.read_csv(
-        arquivo, sep=sep, encoding=encoding, chunksize=CHUNK_SIZE,
-        dtype=str, keep_default_na=False
-    )
-
-    for chunk in leitor:
+    for chunk in ler_em_blocos(arquivo, sep, encoding):
         for coluna, nome_padrao in colunas_para_restaurar.items():
             chunk[coluna] = desanonimizar_coluna(chunk[coluna], mapa_reverso[nome_padrao])
 
@@ -433,15 +541,22 @@ st.write("")
 
 with st.sidebar:
     st.markdown("### ⚙️ Configurações")
-    separador = st.selectbox("Separador do CSV", [";", ",", "\t", "|"], index=0)
-    encoding = st.selectbox("Codificação", ["utf-8-sig", "utf-8", "latin1", "cp1252"], index=0)
+    separador = st.selectbox("Separador do CSV (ignorado para Excel)", [";", ",", "\t", "|"], index=0)
+    encoding = st.selectbox(
+        "Codificação do CSV (ignorado para Excel)",
+        ["Automático", "utf-8-sig", "utf-8", "cp1252", "latin1"],
+        index=0,
+    )
 
 aba_anonimizar, aba_desanonimizar = st.tabs(["🔒 Anonimizar", "🔓 Desanonimizar"])
 
 with aba_anonimizar:
     with st.container(border=True):
-        arquivo = st.file_uploader("Arquivo CSV para anonimizar", type=["csv", "txt"], key="upload_anon")
-
+        arquivo = st.file_uploader(
+            "Arquivo para anonimizar (CSV, TXT ou Excel)",
+            type=["csv", "txt", "xlsx", "xls"], key="upload_anon",
+        )
+        
         if arquivo is not None:
             st.caption(f"📄 {arquivo.name} — {arquivo.size / 1_048_576:.1f} MB")
             if st.button("▶️ Iniciar anonimização", type="primary", key="btn_anon"):

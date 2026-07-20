@@ -71,7 +71,7 @@ BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 # Colunas oferecidas no filtro de valores (categóricas, baixa cardinalidade).
 # EAN e SKU ficam de fora do filtro por terem alta cardinalidade -- um
 # multiselect com milhões de opções não seria usável.
-COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf"}
+COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf", "sku"}
 
 
 # ---------------------------------------------------------------------------
@@ -287,10 +287,11 @@ def ler_em_blocos(arquivo, sep, encoding):
 
 
 def analisar_arquivo(arquivo, sep, encoding):
-    """Varre o arquivo (em blocos) para: (1) identificar colunas-alvo
-    presentes, e (2) coletar valores únicos das colunas categóricas
-    filtráveis (fornecedor, marca, canal, uf)."""
-    colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
+    """Varre o arquivo (em blocos) para: (1) listar todas as colunas do
+    arquivo, (2) identificar quais são colunas-alvo, e (3) coletar valores
+    únicos das colunas categóricas filtráveis (fornecedor, marca, canal,
+    uf, sku)."""
+    colunas_arquivo = list(ler_colunas_amostra(arquivo, sep, encoding))
     colunas_alvo = identificar_colunas(colunas_arquivo)
 
     colunas_filtro = {
@@ -309,31 +310,36 @@ def analisar_arquivo(arquivo, sep, encoding):
                     valores_unicos[col].update(v for v in valores if str(v).strip() != "")
 
     valores_unicos_ordenados = {c: sorted(v, key=str) for c, v in valores_unicos.items()}
-    return colunas_alvo, colunas_filtro, valores_unicos_ordenados
+    return colunas_arquivo, colunas_alvo, colunas_filtro, valores_unicos_ordenados
 
 
 # ---------------------------------------------------------------------------
 # Processamento: anonimização
 # ---------------------------------------------------------------------------
-def processar_anonimizacao(arquivo, sep, encoding, colunas_selecionadas=None, filtros=None):
+def processar_anonimizacao(arquivo, sep, encoding, colunas_finais=None, filtros=None):
     tamanho_total = arquivo.size
     mapas, proximo_seq = carregar_mapa(None)
 
-    colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
+    colunas_arquivo = list(ler_colunas_amostra(arquivo, sep, encoding))
     colunas_alvo = identificar_colunas(colunas_arquivo)
 
-    if colunas_selecionadas:
-        colunas_alvo = {
-            col: idx for col, idx in colunas_alvo.items()
-            if COLUNAS_ALVO[idx]["nome"] in colunas_selecionadas
-        }
+    # As colunas categóricas detectadas (fornecedor, ean, marca, sku, canal,
+    # uf) são SEMPRE anonimizadas -- não é uma escolha do usuário. O que o
+    # usuário escolhe é quais colunas (de todas do arquivo) vão para o
+    # resultado final; se uma coluna-alvo for excluída do resultado, ela
+    # simplesmente não aparece (não há o que anonimizar nela).
+    if colunas_finais:
+        colunas_saida = [c for c in colunas_arquivo if c in colunas_finais]
+        colunas_alvo = {col: idx for col, idx in colunas_alvo.items() if col in colunas_finais}
+    else:
+        colunas_saida = colunas_arquivo
 
     if not colunas_alvo:
-        st.warning("Nenhuma coluna-alvo selecionada foi encontrada no arquivo.")
+        st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) está incluída no arquivo final.")
         return
 
     st.info(
-        "Colunas a anonimizar: "
+        "Colunas anonimizadas: "
         + ", ".join(f"**{col}** → {COLUNAS_ALVO[i]['nome']}" for col, i in colunas_alvo.items())
     )
 
@@ -363,7 +369,11 @@ def processar_anonimizacao(arquivo, sep, encoding, colunas_selecionadas=None, fi
 
         if not chunk.empty:
             for coluna, indice in colunas_alvo.items():
-                chunk[coluna] = anonimizar_coluna(chunk[coluna], indice, mapas, proximo_seq)
+                if coluna in chunk.columns:
+                    chunk[coluna] = anonimizar_coluna(chunk[coluna], indice, mapas, proximo_seq)
+
+            colunas_presentes = [c for c in colunas_saida if c in chunk.columns]
+            chunk = chunk[colunas_presentes]
 
             chunk.to_csv(saida_tmp, sep=sep, index=False, header=primeiro_chunk)
             primeiro_chunk = False
@@ -633,12 +643,13 @@ with aba_anonimizar:
                     else:
                         encoding_usar = encoding
 
-                    colunas_alvo, colunas_filtro, valores_unicos = analisar_arquivo(
+                    colunas_arquivo, colunas_alvo, colunas_filtro, valores_unicos = analisar_arquivo(
                         arquivo, separador, encoding_usar
                     )
 
                 st.session_state["analise_anon"] = {
                     "arquivo_nome": arquivo.name,
+                    "colunas_arquivo": colunas_arquivo,
                     "colunas_alvo": colunas_alvo,
                     "colunas_filtro": colunas_filtro,
                     "valores_unicos": valores_unicos,
@@ -650,15 +661,19 @@ with aba_anonimizar:
         if not analise["colunas_alvo"]:
             st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) foi encontrada neste arquivo.")
         else:
-            with st.container(border=True):
-                st.markdown("**1. Colunas a anonimizar**")
+            nomes_categoricos_detectados = sorted({COLUNAS_ALVO[i]["nome"] for i in analise["colunas_alvo"].values()})
 
-                nomes_disponiveis = sorted({COLUNAS_ALVO[i]["nome"] for i in analise["colunas_alvo"].values()})
+            with st.container(border=True):
+                st.markdown("**1. Colunas que vão para o arquivo final**")
+                st.caption(
+                    "As colunas categóricas (" + ", ".join(nomes_categoricos_detectados)
+                    + ") são sempre anonimizadas quando incluídas. Desmarque aqui só o que você não quer no resultado."
+                )
 
                 def _marcar_todas_colunas():
                     valor = st.session_state["marcar_todas_colunas_anon"]
-                    for nome in nomes_disponiveis:
-                        st.session_state[f"col_anon_{nome}"] = valor
+                    for col in analise["colunas_arquivo"]:
+                        st.session_state[f"col_final_{col}"] = valor
 
                 st.checkbox(
                     "Selecionar todas", value=True, key="marcar_todas_colunas_anon",
@@ -666,40 +681,44 @@ with aba_anonimizar:
                 )
 
                 colunas_marcadas = {}
-                cols_ui = st.columns(3)
-                for i, nome in enumerate(nomes_disponiveis):
-                    with cols_ui[i % 3]:
-                        chave_widget = f"col_anon_{nome}"
+                cols_ui = st.columns(4)
+                for i, col in enumerate(analise["colunas_arquivo"]):
+                    with cols_ui[i % 4]:
+                        chave_widget = f"col_final_{col}"
                         if chave_widget not in st.session_state:
                             st.session_state[chave_widget] = True
-                        colunas_marcadas[nome] = st.checkbox(nome.capitalize(), key=chave_widget)
+                        rotulo = col
+                        if col in analise["colunas_alvo"]:
+                            rotulo += " 🔒"  # marca visualmente as que serão anonimizadas
+                        colunas_marcadas[col] = st.checkbox(rotulo, key=chave_widget)
 
                 filtros_selecionados = {}
                 if analise["colunas_filtro"]:
                     st.divider()
                     st.markdown("**2. Filtrar valores (opcional — vazio mantém tudo)**")
-                    st.caption(
-                        "Use para direcionar a análise a um recorte específico, ex: só um fabricante ou uma marca. "
-                        "EAN e SKU não entram aqui por terem cardinalidade muito alta."
-                    )
-                    for col, nome in analise["colunas_filtro"].items():
-                        opcoes = analise["valores_unicos"].get(col, [])
-                        selecionados = st.multiselect(
-                            f"{nome.capitalize()} ({col})", opcoes, key=f"filtro_anon_{col}"
-                        )
-                        if selecionados:
-                            filtros_selecionados[col] = selecionados
+                    st.caption("Direcione a análise a um recorte específico, ex: só um fabricante ou uma marca.")
+
+                    colunas_filtro_itens = list(analise["colunas_filtro"].items())
+                    cols_filtro_ui = st.columns(min(len(colunas_filtro_itens), 4))
+                    for i, (col, nome) in enumerate(colunas_filtro_itens):
+                        with cols_filtro_ui[i % 4]:
+                            opcoes = analise["valores_unicos"].get(col, [])
+                            selecionados = st.multiselect(
+                                nome.capitalize(), opcoes, key=f"filtro_anon_{col}"
+                            )
+                            if selecionados:
+                                filtros_selecionados[col] = selecionados
 
                 st.divider()
                 st.markdown("**3. Anonimizar**")
                 if st.button("▶️ Iniciar anonimização", type="primary", key="btn_anon"):
-                    colunas_selecionadas_nomes = {n for n, v in colunas_marcadas.items() if v}
-                    if not colunas_selecionadas_nomes:
-                        st.warning("Selecione ao menos uma coluna para anonimizar.")
+                    colunas_finais_selecionadas = {c for c, v in colunas_marcadas.items() if v}
+                    if not colunas_finais_selecionadas:
+                        st.warning("Selecione ao menos uma coluna para o arquivo final.")
                     else:
                         processar_anonimizacao(
                             arquivo, separador, analise["encoding_usado"],
-                            colunas_selecionadas_nomes, filtros_selecionados,
+                            colunas_finais_selecionadas, filtros_selecionados,
                         )
 
     if "resultado_anon" in st.session_state:

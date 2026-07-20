@@ -1,10 +1,17 @@
 """
-Anonimizador de grandes volumes de dados (CSV) — Scanntech.
+Anonimizador de grandes volumes de dados (CSV/Excel) — Scanntech.
 
-Anonimiza/desanonimiza fornecedor, ean, marca, sku, canal e uf. As demais
-colunas ficam intactas. Os códigos anonimizados são sempre numéricos.
-Processa em blocos (chunks) para suportar arquivos de 600MB+ sem carregar
-tudo na memória de uma vez.
+Anonimiza fornecedor, ean, marca, sku, canal e uf. As demais colunas ficam
+intactas. Os códigos gerados são sempre numéricos. Processa em blocos para
+suportar arquivos de 600MB+ sem carregar tudo na memória de uma vez.
+
+Fluxo de anonimização:
+  1. Sobe o arquivo.
+  2. Analisa (detecta colunas-alvo e escaneia valores únicos das colunas
+     categóricas filtráveis: fornecedor, marca, canal, uf).
+  3. Escolhe quais colunas anonimizar e, opcionalmente, filtra valores
+     específicos (ex: só um fabricante) para direcionar a análise.
+  4. Anonimiza só a base filtrada.
 """
 
 import os
@@ -47,7 +54,7 @@ COLUNAS_ALVO = {
         "aliases": [
             "sku", "nome sku", "cod sku", "codigo sku", "descricao sku",
             "produto", "nome produto", "descricao produto", "descricao",
-            "nome do produto", "item", "nome item", "nome do item", "nombre sku"
+            "nome do produto", "item", "nome item", "nome do item",
         ],
     },
     5: {
@@ -61,6 +68,11 @@ COLUNAS_ALVO = {
 }
 BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 
+# Colunas oferecidas no filtro de valores (categóricas, baixa cardinalidade).
+# EAN e SKU ficam de fora do filtro por terem alta cardinalidade -- um
+# multiselect com milhões de opções não seria usável.
+COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf"}
+
 
 # ---------------------------------------------------------------------------
 # Funções auxiliares
@@ -68,6 +80,14 @@ BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 def normalizar(texto):
     texto = str(texto).strip().lower()
     return unicodedata.normalize("NFKD", texto).encode("ascii", "ignore").decode()
+
+
+def normalizar_chave(texto):
+    """Remove acento, minusculiza e tira espaço/underscore/hífen/pontuação
+    -- assim 'Nome SKU', 'nome_sku' e 'Nome-Sku' todos virem 'nomesku' e
+    casam entre si, independente de como a coluna foi escrita."""
+    texto = normalizar(texto)
+    return re.sub(r"[^a-z0-9]", "", texto)
 
 
 def padronizar_canal(valor):
@@ -81,14 +101,6 @@ def padronizar_canal(valor):
     if v in ("atacarejo", "atacado", "cash_carry", "cash_and_carry"):
         return "canal_atacarejo"
     return v
-
-
-def normalizar_chave(texto):
-    """Remove acento, minusculiza e tira espaço/underscore/hífen/pontuação
-    -- assim 'Nome SKU', 'nome_sku' e 'Nome-Sku' todos virem 'nomesku' e
-    casam entre si, independente de como a coluna foi escrita."""
-    texto = normalizar(texto)
-    return re.sub(r"[^a-z0-9]", "", texto)
 
 
 def identificar_colunas(colunas_arquivo):
@@ -166,26 +178,24 @@ def anonimizar_coluna(serie, indice, mapas, proximo_seq):
             continue
         chave_por_valor[v] = padronizar_canal(v_str) if eh_canal else normalizar(v_str)
 
-    novos_registros = []
     for chave in set(chave_por_valor.values()):
         if chave not in mapa_coluna:
             codigo = indice * BASE_INDICE + proximo_seq[indice]
             mapa_coluna[chave] = codigo
             proximo_seq[indice] += 1
-            novos_registros.append({"coluna": nome_coluna, "valor_original": chave, "codigo": codigo})
 
     codigo_por_valor = {v: mapa_coluna[chave] for v, chave in chave_por_valor.items()}
     resultado = serie.map(codigo_por_valor)
 
     # .map() força a coluna inteira para float64 quando há NaN misturado
-    # com os códigos inteiros — por isso reconstruímos como object.
+    # com os códigos inteiros -- por isso reconstruímos como object.
     resultado = pd.Series(
         [None if pd.isna(x) else int(x) for x in resultado],
         index=resultado.index, dtype="object"
     )
-    resultado = resultado.where(resultado.notna(), serie)
+    resultado = resultado.where(resultado.notna(), serie)  # mantém em branco/NaN como estava
 
-    return resultado, novos_registros
+    return resultado
 
 
 def tentar_numerico(serie):
@@ -212,8 +222,12 @@ def desanonimizar_coluna(serie, mapa_coluna):
 
 
 def construir_df_mapa(mapas):
+    # MELHORIA: valor_original sempre em MAIÚSCULA na referência, para ficar
+    # mais legível quando for desanonimizar depois. A chave interna do
+    # dicionário (usada para deduplicar) continua normalizada em minúscula
+    # -- isso aqui só afeta o texto exibido/exportado.
     linhas = [
-        {"coluna": COLUNAS_ALVO[indice]["nome"], "valor_original": chave, "codigo": codigo}
+        {"coluna": COLUNAS_ALVO[indice]["nome"], "valor_original": chave.upper(), "codigo": codigo}
         for indice, mapa in mapas.items()
         for chave, codigo in mapa.items()
     ]
@@ -229,6 +243,7 @@ def formatar_tempo(segundos):
         return f"{m}m{s:02d}s"
     h, m = divmod(m, 60)
     return f"{h}h{m:02d}m"
+
 
 def detectar_encoding(arquivo, tamanho_amostra=200_000):
     """Detecta automaticamente a codificação do arquivo a partir de uma
@@ -259,6 +274,7 @@ def ler_em_blocos(arquivo, sep, encoding):
     sustenta 600MB+). Excel: lido de uma vez só, já que o pandas não tem
     leitura em blocos nativa para xlsx -- para arquivos MUITO grandes,
     prefira CSV."""
+    arquivo.seek(0)
     if eh_excel(arquivo):
         yield pd.read_excel(arquivo, dtype=str)
     else:
@@ -270,65 +286,118 @@ def ler_em_blocos(arquivo, sep, encoding):
             yield chunk
 
 
+def analisar_arquivo(arquivo, sep, encoding):
+    """Varre o arquivo (em blocos) para: (1) identificar colunas-alvo
+    presentes, e (2) coletar valores únicos das colunas categóricas
+    filtráveis (fornecedor, marca, canal, uf)."""
+    colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
+    colunas_alvo = identificar_colunas(colunas_arquivo)
+
+    colunas_filtro = {
+        col: COLUNAS_ALVO[idx]["nome"]
+        for col, idx in colunas_alvo.items()
+        if COLUNAS_ALVO[idx]["nome"] in COLUNAS_FILTRAVEIS
+    }
+
+    valores_unicos = {col: set() for col in colunas_filtro}
+
+    if colunas_filtro:
+        for chunk in ler_em_blocos(arquivo, sep, encoding):
+            for col in colunas_filtro:
+                if col in chunk.columns:
+                    valores = chunk[col].dropna().unique()
+                    valores_unicos[col].update(v for v in valores if str(v).strip() != "")
+
+    valores_unicos_ordenados = {c: sorted(v, key=str) for c, v in valores_unicos.items()}
+    return colunas_alvo, colunas_filtro, valores_unicos_ordenados
+
+
 # ---------------------------------------------------------------------------
 # Processamento: anonimização
 # ---------------------------------------------------------------------------
-def processar_anonimizacao(arquivo, sep, encoding_manual, arquivo_mapa_anterior):
+def processar_anonimizacao(arquivo, sep, encoding, colunas_selecionadas=None, filtros=None):
     tamanho_total = arquivo.size
-    mapas, proximo_seq = carregar_mapa(arquivo_mapa_anterior)
-
-    if eh_excel(arquivo):
-        encoding = None
-    elif encoding_manual == "Automático":
-        encoding = detectar_encoding(arquivo)
-        st.caption(f"🔎 Codificação detectada automaticamente: **{encoding}**")
-    else:
-        encoding = encoding_manual
+    mapas, proximo_seq = carregar_mapa(None)
 
     colunas_arquivo = ler_colunas_amostra(arquivo, sep, encoding)
     colunas_alvo = identificar_colunas(colunas_arquivo)
 
+    if colunas_selecionadas:
+        colunas_alvo = {
+            col: idx for col, idx in colunas_alvo.items()
+            if COLUNAS_ALVO[idx]["nome"] in colunas_selecionadas
+        }
+
     if not colunas_alvo:
-        st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) foi encontrada no arquivo.")
+        st.warning("Nenhuma coluna-alvo selecionada foi encontrada no arquivo.")
         return
 
     st.info(
-        "Colunas identificadas: "
+        "Colunas a anonimizar: "
         + ", ".join(f"**{col}** → {COLUNAS_ALVO[i]['nome']}" for col, i in colunas_alvo.items())
     )
+
+    if filtros:
+        descricao_filtros = "; ".join(f"{nome_col} em {valores}" for nome_col, valores in filtros.items())
+        st.info(f"🔎 Filtro aplicado: {descricao_filtros}")
 
     status = st.empty()
     barra = st.progress(0.0)
     inicio = time.time()
 
     saida_tmp = tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False, encoding="utf-8-sig", newline="")
-    linhas_processadas = 0
+    linhas_lidas = 0
+    linhas_mantidas = 0
     primeiro_chunk = True
 
     for chunk in ler_em_blocos(arquivo, sep, encoding):
-        for coluna, indice in colunas_alvo.items():
-            chunk[coluna], _ = anonimizar_coluna(chunk[coluna], indice, mapas, proximo_seq)
+        linhas_lidas += len(chunk)
 
-        chunk.to_csv(saida_tmp, sep=sep, index=False, header=primeiro_chunk)
-        primeiro_chunk = False
-        linhas_processadas += len(chunk)
+        if filtros:
+            mascara = pd.Series(True, index=chunk.index)
+            for col, valores in filtros.items():
+                if col in chunk.columns:
+                    valores_str = {str(v) for v in valores}
+                    mascara &= chunk[col].astype(str).isin(valores_str)
+            chunk = chunk[mascara]
+
+        if not chunk.empty:
+            for coluna, indice in colunas_alvo.items():
+                chunk[coluna] = anonimizar_coluna(chunk[coluna], indice, mapas, proximo_seq)
+
+            chunk.to_csv(saida_tmp, sep=sep, index=False, header=primeiro_chunk)
+            primeiro_chunk = False
+            linhas_mantidas += len(chunk)
 
         fracao = min(arquivo.tell() / tamanho_total, 1.0) if tamanho_total else 0.0
         barra.progress(fracao)
         elapsed = time.time() - inicio
         eta_txt = formatar_tempo(elapsed / fracao - elapsed) if fracao > 0.02 else "calculando..."
-        status.text(f"Anonimizando... {fracao * 100:.1f}% — {linhas_processadas:,} linhas — tempo restante: {eta_txt}")
+        status.text(
+            f"Anonimizando... {fracao * 100:.1f}% — {linhas_mantidas:,} linhas mantidas "
+            f"de {linhas_lidas:,} lidas — tempo restante: {eta_txt}"
+        )
 
     saida_tmp.close()
     barra.progress(1.0)
-    status.text(f"Concluído: {linhas_processadas:,} linhas em {formatar_tempo(time.time() - inicio)}.")
+
+    if primeiro_chunk:
+        status.text("Concluído: nenhuma linha correspondeu ao filtro.")
+        st.warning("Nenhuma linha do arquivo correspondeu ao filtro selecionado. Ajuste os filtros e tente novamente.")
+        return
+
+    status.text(
+        f"Concluído: {linhas_mantidas:,} linhas no arquivo final "
+        f"(de {linhas_lidas:,} lidas) em {formatar_tempo(time.time() - inicio)}."
+    )
 
     df_mapa = construir_df_mapa(mapas)
 
     st.session_state["resultado_anon"] = {
         "csv_path": saida_tmp.name,
         "mapa_csv_bytes": df_mapa.to_csv(index=False).encode("utf-8-sig"),
-        "total_linhas": linhas_processadas,
+        "total_linhas": linhas_mantidas,
+        "total_lidas": linhas_lidas,
         "total_mapeados": len(df_mapa),
     }
 
@@ -403,9 +472,6 @@ def processar_desanonimizacao(arquivo, sep, encoding_manual, arquivo_mapa):
 
 
 # ---------------------------------------------------------------------------
-# Interface
-# ---------------------------------------------------------------------------
-# ---------------------------------------------------------------------------
 # Interface (perfil executivo, clean)
 # ---------------------------------------------------------------------------
 CSS_EXECUTIVO = """
@@ -415,6 +481,7 @@ CSS_EXECUTIVO = """
     }
     section[data-testid="stSidebar"] {
         background-color: #0B1F3A;
+        padding-top: 0;
     }
     section[data-testid="stSidebar"] label,
     section[data-testid="stSidebar"] p,
@@ -428,6 +495,9 @@ CSS_EXECUTIVO = """
     }
     section[data-testid="stSidebar"] div[data-baseweb="select"] * {
         color: #0B1F3A !important;
+    }
+    [data-testid="stSidebarUserContent"] {
+        padding-top: 1.5rem;
     }
     div[data-testid="stFileUploader"] {
         background: white;
@@ -508,14 +578,8 @@ CSS_EXECUTIVO = """
     div[data-testid="stImage"] {
         position: fixed;
         top: 1.1rem;
-        right: 60rem;
+        left: 23rem;
         z-index: 1000;
-    }
-    section[data-testid="stSidebar"] {
-        padding-top: 0;
-    }
-    [data-testid="stSidebarUserContent"] {
-        padding-top: 1.5rem;
     }
     div[data-testid="stMarkdownContainer"] h1,
     div[data-testid="stMarkdownContainer"] p {
@@ -528,10 +592,10 @@ st.set_page_config(page_title="Anonimizador Scanntech", page_icon="🔒", layout
 st.markdown(CSS_EXECUTIVO, unsafe_allow_html=True)
 
 if os.path.exists("logo_scanntech.png"):
-    st.image("logo_scanntech.png", width=220)
+    st.image("logo_scanntech.png", width=260)
 
 st.markdown(
-    "<h1 style='color:#0B1F3A; margin-bottom:0;'>Anonimizador de Dados</h1>"
+    "<h1 style='color:#054FE1; margin-bottom:0;'>Anonimizador de Dados</h1>"
     "<p style='color:#5A6B85; margin-top:2px;'>Fornecedor · EAN · Marca · SKU · Canal · UF"
     " — códigos sempre numéricos</p>",
     unsafe_allow_html=True,
@@ -556,11 +620,87 @@ with aba_anonimizar:
             "Arquivo para anonimizar (CSV, TXT ou Excel)",
             type=["csv", "txt", "xlsx", "xls"], key="upload_anon",
         )
-        
+
         if arquivo is not None:
             st.caption(f"📄 {arquivo.name} — {arquivo.size / 1_048_576:.1f} MB")
-            if st.button("▶️ Iniciar anonimização", type="primary", key="btn_anon"):
-                processar_anonimizacao(arquivo, separador, encoding, None)
+
+            if st.button("🔍 Analisar colunas e valores", key="btn_analisar_anon"):
+                with st.spinner("Lendo colunas e valores únicos das colunas categóricas..."):
+                    if eh_excel(arquivo):
+                        encoding_usar = None
+                    elif encoding == "Automático":
+                        encoding_usar = detectar_encoding(arquivo)
+                    else:
+                        encoding_usar = encoding
+
+                    colunas_alvo, colunas_filtro, valores_unicos = analisar_arquivo(
+                        arquivo, separador, encoding_usar
+                    )
+
+                st.session_state["analise_anon"] = {
+                    "arquivo_nome": arquivo.name,
+                    "colunas_alvo": colunas_alvo,
+                    "colunas_filtro": colunas_filtro,
+                    "valores_unicos": valores_unicos,
+                    "encoding_usado": encoding_usar,
+                }
+
+    analise = st.session_state.get("analise_anon")
+    if analise is not None and arquivo is not None and analise["arquivo_nome"] == arquivo.name:
+        if not analise["colunas_alvo"]:
+            st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) foi encontrada neste arquivo.")
+        else:
+            with st.container(border=True):
+                st.markdown("**1. Colunas a anonimizar**")
+
+                nomes_disponiveis = sorted({COLUNAS_ALVO[i]["nome"] for i in analise["colunas_alvo"].values()})
+
+                def _marcar_todas_colunas():
+                    valor = st.session_state["marcar_todas_colunas_anon"]
+                    for nome in nomes_disponiveis:
+                        st.session_state[f"col_anon_{nome}"] = valor
+
+                st.checkbox(
+                    "Selecionar todas", value=True, key="marcar_todas_colunas_anon",
+                    on_change=_marcar_todas_colunas,
+                )
+
+                colunas_marcadas = {}
+                cols_ui = st.columns(3)
+                for i, nome in enumerate(nomes_disponiveis):
+                    with cols_ui[i % 3]:
+                        chave_widget = f"col_anon_{nome}"
+                        if chave_widget not in st.session_state:
+                            st.session_state[chave_widget] = True
+                        colunas_marcadas[nome] = st.checkbox(nome.capitalize(), key=chave_widget)
+
+                filtros_selecionados = {}
+                if analise["colunas_filtro"]:
+                    st.divider()
+                    st.markdown("**2. Filtrar valores (opcional — vazio mantém tudo)**")
+                    st.caption(
+                        "Use para direcionar a análise a um recorte específico, ex: só um fabricante ou uma marca. "
+                        "EAN e SKU não entram aqui por terem cardinalidade muito alta."
+                    )
+                    for col, nome in analise["colunas_filtro"].items():
+                        opcoes = analise["valores_unicos"].get(col, [])
+                        selecionados = st.multiselect(
+                            f"{nome.capitalize()} ({col})", opcoes, key=f"filtro_anon_{col}"
+                        )
+                        if selecionados:
+                            filtros_selecionados[col] = selecionados
+
+                st.divider()
+                st.markdown("**3. Anonimizar**")
+                if st.button("▶️ Iniciar anonimização", type="primary", key="btn_anon"):
+                    colunas_selecionadas_nomes = {n for n, v in colunas_marcadas.items() if v}
+                    if not colunas_selecionadas_nomes:
+                        st.warning("Selecione ao menos uma coluna para anonimizar.")
+                    else:
+                        processar_anonimizacao(
+                            arquivo, separador, analise["encoding_usado"],
+                            colunas_selecionadas_nomes, filtros_selecionados,
+                        )
 
     if "resultado_anon" in st.session_state:
         resultado = st.session_state["resultado_anon"]
@@ -568,7 +708,7 @@ with aba_anonimizar:
         with st.container(border=True):
             st.success("✅ Anonimização concluída")
             c1, c2 = st.columns(2)
-            c1.metric("Linhas processadas", f"{resultado['total_linhas']:,}")
+            c1.metric("Linhas no arquivo final", f"{resultado['total_linhas']:,}")
             c2.metric("Valores únicos mapeados", f"{resultado['total_mapeados']:,}")
 
             col_a, col_b = st.columns(2)
@@ -589,7 +729,10 @@ with aba_anonimizar:
 with aba_desanonimizar:
     with st.container(border=True):
         arquivo_mapa = st.file_uploader("Mapeamento (referência)", type=["csv"], key="upload_mapa_desanon")
-        arquivo_desanon = st.file_uploader("CSV anonimizado", type=["csv", "txt"], key="upload_desanon")
+        arquivo_desanon = st.file_uploader(
+            "Arquivo anonimizado (CSV, TXT ou Excel)",
+            type=["csv", "txt", "xlsx", "xls"], key="upload_desanon",
+        )
 
         if arquivo_desanon is not None:
             st.caption(f"📄 {arquivo_desanon.name} — {arquivo_desanon.size / 1_048_576:.1f} MB")

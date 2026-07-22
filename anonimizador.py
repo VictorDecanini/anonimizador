@@ -323,16 +323,24 @@ def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
     """Ajusta os candidatos encontrados por NOME (identificar_colunas) com
     base no CONTEÚDO real da coluna. Um arquivo real costuma ter várias
     colunas derivadas com o nome da categoria dentro (ex: N1_DN_MARCA,
-    N1_GIRO_MARCA, Marca_Indice...) além da coluna "de verdade" -- por
-    isso, para cada categoria, escolhemos só UMA coluna representante:
-    a PRIMEIRA (na ordem do arquivo) que não seja numérica. As demais
-    colunas que também casaram pelo nome ficam livres -- não são
+    N1_GIRO_MARCA, N1_DP_SKU...) além da(s) coluna(s) "de verdade" -- por
+    isso, para cada categoria, escolhemos poucos representantes, não todo
+    mundo que casou pelo nome. As demais ficam livres -- não são
     anonimizadas nem entram em filtro, só aparecem como coluna comum no
     seletor de colunas do arquivo final.
 
-    Exceção: EAN e SKU são numéricos por natureza (SKU pode, na prática,
-    ser o próprio EAN), então não passam pela checagem de conteúdo -- só
-    pegam a primeira ocorrência mesmo assim, numérica ou não.
+    - EAN: sempre numérico -- pega só a primeira ocorrência, sem checar
+      conteúdo.
+    - SKU: pode existir tanto uma versão numérica (às vezes é o próprio
+      EAN) quanto uma versão textual (a descrição do SKU, ex: NOMBRE_SKU)
+      -- as duas são dados sensíveis e devem ser anonimizadas. Por isso o
+      SKU tem DOIS "slots": a primeira ocorrência numérica E a primeira
+      ocorrência não numérica, cada uma no máximo uma vez. As demais
+      colunas com "sku" no nome (ex: métricas derivadas como N1_DP_SKU)
+      ficam de fora.
+    - Fornecedor / Marca / Canal / UF / Nivel1: só a primeira ocorrência
+      NÃO numérica -- candidatas numéricas nessas categorias são sempre
+      falso positivo (nome parecido, conteúdo não é essa categoria).
     """
     nome_para_indice = {info["nome"]: idx for idx, info in COLUNAS_ALVO.items()}
     idx_ean = nome_para_indice["ean"]
@@ -345,9 +353,25 @@ def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
     colunas_alvo_final = {}
 
     for idx, cols in candidatos_por_indice.items():
-        if idx in (idx_ean, idx_sku):
+        if idx == idx_ean:
             if cols:
                 colunas_alvo_final[cols[0]] = idx
+            continue
+
+        if idx == idx_sku:
+            primeira_numerica = None
+            primeira_nao_numerica = None
+            for col in cols:
+                if col not in amostra_df.columns:
+                    continue
+                if coluna_eh_numerica(amostra_df[col]):
+                    if primeira_numerica is None:
+                        primeira_numerica = col
+                elif primeira_nao_numerica is None:
+                    primeira_nao_numerica = col
+            for col in (primeira_numerica, primeira_nao_numerica):
+                if col is not None:
+                    colunas_alvo_final[col] = idx
             continue
 
         for col in cols:

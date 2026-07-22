@@ -269,6 +269,80 @@ def ler_colunas_amostra(arquivo, sep, encoding):
     return amostra.columns
 
 
+def ler_amostra_dados(arquivo, sep, encoding, nrows=2000):
+    """Como ler_colunas_amostra, mas devolve os DADOS da amostra (não só os
+    nomes das colunas) -- necessário para verificar se uma coluna é
+    numérica antes de aceitá-la como categórica."""
+    arquivo.seek(0)
+    if eh_excel(arquivo):
+        amostra = pd.read_excel(arquivo, nrows=nrows, dtype=str)
+    else:
+        amostra = pd.read_csv(arquivo, sep=sep, encoding=encoding, nrows=nrows, dtype=str)
+    arquivo.seek(0)
+    return amostra
+
+
+def coluna_eh_numerica(serie, limiar=0.9):
+    """Considera a coluna numérica se pelo menos `limiar` dos valores não
+    vazios da amostra forem parseáveis como número."""
+    valores = serie.dropna()
+    valores = valores[valores.astype(str).str.strip() != ""]
+    if len(valores) == 0:
+        return False
+    convertido = pd.to_numeric(valores, errors="coerce")
+    return convertido.notna().mean() >= limiar
+
+
+def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
+    """Ajusta os candidatos encontrados por NOME (identificar_colunas) com
+    base no CONTEÚDO real da coluna -- corrige falsos positivos, como uma
+    coluna numérica qualquer (ex: um índice, uma métrica) que contenha
+    'marca', 'sku' ou 'fabricante' no nome e acabe casando por engano.
+
+    Regras:
+    - EAN: numérico é o esperado (é um código numérico por natureza) --
+      todos os candidatos continuam como alvo, sem checagem de conteúdo.
+    - SKU: candidatos NÃO numéricos sempre continuam como alvo. Entre os
+      candidatos NUMÉRICOS, só o primeiro (na ordem em que aparecem no
+      arquivo) é mantido como alvo anonimizável -- os demais deixam de
+      ser tratados como coluna-alvo (viram colunas comuns).
+    - Fornecedor / Marca / Canal / UF: candidatos numéricos são descartados
+      por completo -- não são de fato essa categoria, só têm nome parecido.
+    """
+    nome_para_indice = {info["nome"]: idx for idx, info in COLUNAS_ALVO.items()}
+    idx_ean = nome_para_indice["ean"]
+    idx_sku = nome_para_indice["sku"]
+
+    candidatos_por_indice = {}
+    for col, idx in colunas_candidatas.items():
+        candidatos_por_indice.setdefault(idx, []).append(col)
+
+    colunas_alvo_final = {}
+
+    for idx, cols in candidatos_por_indice.items():
+        if idx == idx_ean:
+            for col in cols:
+                colunas_alvo_final[col] = idx
+            continue
+
+        numericas, nao_numericas = [], []
+        for col in cols:
+            if col in amostra_df.columns and coluna_eh_numerica(amostra_df[col]):
+                numericas.append(col)
+            else:
+                nao_numericas.append(col)
+
+        for col in nao_numericas:
+            colunas_alvo_final[col] = idx
+
+        if idx == idx_sku and numericas:
+            colunas_alvo_final[numericas[0]] = idx
+        # Fornecedor/Marca/Canal/UF numéricas: descartadas por completo
+        # (não entram em colunas_alvo_final).
+
+    return colunas_alvo_final
+
+
 def ler_em_blocos(arquivo, sep, encoding):
     """Gera blocos do arquivo. CSV/TXT: em blocos reais (leve na memória,
     sustenta 600MB+). Excel: lido de uma vez só, já que o pandas não tem
@@ -288,11 +362,15 @@ def ler_em_blocos(arquivo, sep, encoding):
 
 def analisar_arquivo(arquivo, sep, encoding):
     """Varre o arquivo (em blocos) para: (1) listar todas as colunas do
-    arquivo, (2) identificar quais são colunas-alvo, e (3) coletar valores
-    únicos das colunas categóricas filtráveis (fornecedor, marca, canal,
-    uf, sku)."""
-    colunas_arquivo = list(ler_colunas_amostra(arquivo, sep, encoding))
-    colunas_alvo = identificar_colunas(colunas_arquivo)
+    arquivo, (2) identificar quais são colunas-alvo -- por nome E por
+    conteúdo, para não confundir uma coluna numérica qualquer com uma
+    categoria de verdade -- e (3) coletar valores únicos das colunas
+    categóricas filtráveis (fornecedor, marca, canal, uf, sku)."""
+    amostra_df = ler_amostra_dados(arquivo, sep, encoding)
+    colunas_arquivo = list(amostra_df.columns)
+
+    candidatos = identificar_colunas(colunas_arquivo)
+    colunas_alvo = refinar_colunas_por_valor(amostra_df, candidatos)
 
     colunas_filtro = {
         col: COLUNAS_ALVO[idx]["nome"]
@@ -316,12 +394,16 @@ def analisar_arquivo(arquivo, sep, encoding):
 # ---------------------------------------------------------------------------
 # Processamento: anonimização
 # ---------------------------------------------------------------------------
-def processar_anonimizacao(arquivo, sep, encoding, colunas_finais=None, filtros=None):
+def processar_anonimizacao(arquivo, sep, encoding, colunas_alvo, colunas_finais=None, filtros=None):
     tamanho_total = arquivo.size
     mapas, proximo_seq = carregar_mapa(None)
 
     colunas_arquivo = list(ler_colunas_amostra(arquivo, sep, encoding))
-    colunas_alvo = identificar_colunas(colunas_arquivo)
+
+    # As colunas-alvo já vêm refinadas (por nome E por conteúdo) da etapa de
+    # análise -- não redetectamos aqui para não reintroduzir falsos
+    # positivos (ex: uma coluna numérica qualquer com "marca" no nome).
+    colunas_alvo = dict(colunas_alvo)
 
     # As colunas categóricas detectadas (fornecedor, ean, marca, sku, canal,
     # uf) são SEMPRE anonimizadas -- não é uma escolha do usuário. O que o
@@ -717,7 +799,7 @@ with aba_anonimizar:
                         st.warning("Selecione ao menos uma coluna para o arquivo final.")
                     else:
                         processar_anonimizacao(
-                            arquivo, separador, analise["encoding_usado"],
+                            arquivo, separador, analise["encoding_usado"], analise["colunas_alvo"],
                             colunas_finais_selecionadas, filtros_selecionados,
                         )
 

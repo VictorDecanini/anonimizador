@@ -1,7 +1,7 @@
 """
 Anonimizador de grandes volumes de dados (CSV/Excel) — Scanntech.
 
-Anonimiza fornecedor, ean, marca, sku, canal e uf. As demais colunas ficam
+Anonimiza fornecedor, ean, marca, sku, canal, uf e nivel1. As demais colunas ficam
 intactas. Os códigos gerados são sempre numéricos. Processa em blocos para
 suportar arquivos de 600MB+ sem carregar tudo na memória de uma vez.
 
@@ -14,7 +14,6 @@ Fluxo de anonimização:
   4. Anonimiza só a base filtrada.
 """
 
-import os
 import re
 import time
 import tempfile
@@ -55,6 +54,7 @@ COLUNAS_ALVO = {
             "sku", "nome sku", "cod sku", "codigo sku", "descricao sku",
             "produto", "nome produto", "descricao produto", "descricao",
             "nome do produto", "item", "nome item", "nome do item",
+            "nombre sku",
         ],
     },
     5: {
@@ -65,13 +65,18 @@ COLUNAS_ALVO = {
         "nome": "uf",
         "aliases": ["uf", "estado", "state", "unidade federativa"],
     },
+    7: {
+        "nome": "nivel1",
+        "aliases": ["nivel 1", "nivel1", "n1"],
+    },
 }
 BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 
 # Colunas oferecidas no filtro de valores (categóricas, baixa cardinalidade).
-# EAN e SKU ficam de fora do filtro por terem alta cardinalidade -- um
-# multiselect com milhões de opções não seria usável.
-COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf", "sku"}
+# EAN fica de fora por ser numérico por natureza. SKU também não entra
+# quando a coluna escolhida for numérica (pode ser, na prática, o próprio
+# EAN) -- essa checagem extra acontece em analisar_arquivo.
+COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf", "sku", "nivel1"}
 
 
 # ---------------------------------------------------------------------------
@@ -325,11 +330,13 @@ def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
     anonimizadas nem entram em filtro, só aparecem como coluna comum no
     seletor de colunas do arquivo final.
 
-    Exceção: EAN é numérico por natureza, então não passa pela checagem de
-    conteúdo -- só pega a primeira ocorrência mesmo assim.
+    Exceção: EAN e SKU são numéricos por natureza (SKU pode, na prática,
+    ser o próprio EAN), então não passam pela checagem de conteúdo -- só
+    pegam a primeira ocorrência mesmo assim, numérica ou não.
     """
     nome_para_indice = {info["nome"]: idx for idx, info in COLUNAS_ALVO.items()}
     idx_ean = nome_para_indice["ean"]
+    idx_sku = nome_para_indice["sku"]
 
     candidatos_por_indice = {}
     for col, idx in colunas_candidatas.items():
@@ -338,7 +345,7 @@ def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
     colunas_alvo_final = {}
 
     for idx, cols in candidatos_por_indice.items():
-        if idx == idx_ean:
+        if idx in (idx_ean, idx_sku):
             if cols:
                 colunas_alvo_final[cols[0]] = idx
             continue
@@ -383,11 +390,17 @@ def analisar_arquivo(arquivo, sep, encoding):
     candidatos = identificar_colunas(colunas_arquivo)
     colunas_alvo = refinar_colunas_por_valor(amostra_df, candidatos)
 
-    colunas_filtro = {
-        col: COLUNAS_ALVO[idx]["nome"]
-        for col, idx in colunas_alvo.items()
-        if COLUNAS_ALVO[idx]["nome"] in COLUNAS_FILTRAVEIS
-    }
+    # Mesmo dentro das categorias normalmente filtráveis, uma coluna
+    # numérica nunca entra no filtro (ex: SKU que na prática é o próprio
+    # EAN) -- só é oferecida a quem tem valor de texto de verdade.
+    colunas_filtro = {}
+    for col, idx in colunas_alvo.items():
+        nome = COLUNAS_ALVO[idx]["nome"]
+        if nome not in COLUNAS_FILTRAVEIS:
+            continue
+        if col in amostra_df.columns and coluna_eh_numerica(amostra_df[col]):
+            continue
+        colunas_filtro[col] = nome
 
     valores_unicos = {col: set() for col in colunas_filtro}
 
@@ -428,7 +441,7 @@ def processar_anonimizacao(arquivo, sep, encoding, colunas_alvo, colunas_finais=
         colunas_saida = colunas_arquivo
 
     if not colunas_alvo:
-        st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) está incluída no arquivo final.")
+        st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf, nivel1) está incluída no arquivo final.")
         return
 
     st.info(
@@ -678,12 +691,6 @@ CSS_EXECUTIVO = """
     .block-container {
         padding-top: 1rem;
     }
-    div[data-testid="stImage"] {
-        position: fixed;
-        top: 1.1rem;
-        left: 23rem;
-        z-index: 1000;
-    }
     div[data-testid="stMarkdownContainer"] h1,
     div[data-testid="stMarkdownContainer"] p {
         text-align: center;
@@ -693,9 +700,6 @@ CSS_EXECUTIVO = """
 
 st.set_page_config(page_title="Anonimizador Scanntech", page_icon="🔒", layout="centered")
 st.markdown(CSS_EXECUTIVO, unsafe_allow_html=True)
-
-if os.path.exists("logo_scanntech.png"):
-    st.image("logo_scanntech.png", width=260)
 
 st.markdown(
     "<h1 style='color:#054FE1; margin-bottom:0;'>Anonimizador de Dados</h1>"
@@ -757,7 +761,7 @@ with aba_anonimizar:
     analise = st.session_state.get("analise_anon")
     if analise is not None and arquivo is not None and analise["arquivo_nome"] == arquivo.name:
         if not analise["colunas_alvo"]:
-            st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf) foi encontrada neste arquivo.")
+            st.warning("Nenhuma coluna-alvo (fornecedor, ean, marca, sku, canal, uf, nivel1) foi encontrada neste arquivo.")
         else:
             nomes_categoricos_detectados = sorted({COLUNAS_ALVO[i]["nome"] for i in analise["colunas_alvo"].values()})
 

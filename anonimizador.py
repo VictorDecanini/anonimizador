@@ -282,36 +282,54 @@ def ler_amostra_dados(arquivo, sep, encoding, nrows=2000):
     return amostra
 
 
+def _tentar_numero_br(valor):
+    """Tenta converter um valor para número, aceitando tanto formato
+    americano (1234.56) quanto brasileiro (1.234,56 ou 1234,56) -- sem
+    isso, qualquer coluna numérica formatada com vírgula decimal era
+    erroneamente tratada como texto/categórica."""
+    if pd.isna(valor):
+        return None
+    texto = str(valor).strip()
+    if texto == "":
+        return None
+    try:
+        return float(texto)
+    except ValueError:
+        pass
+    texto_br = texto.replace(".", "").replace(",", ".")
+    try:
+        return float(texto_br)
+    except ValueError:
+        return None
+
+
 def coluna_eh_numerica(serie, limiar=0.9):
     """Considera a coluna numérica se pelo menos `limiar` dos valores não
-    vazios da amostra forem parseáveis como número."""
+    vazios da amostra forem parseáveis como número (formato BR ou US)."""
     valores = serie.dropna()
     valores = valores[valores.astype(str).str.strip() != ""]
     if len(valores) == 0:
         return False
-    convertido = pd.to_numeric(valores, errors="coerce")
-    return convertido.notna().mean() >= limiar
+    taxa = valores.apply(_tentar_numero_br).notna().mean()
+    return taxa >= limiar
 
 
 def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
     """Ajusta os candidatos encontrados por NOME (identificar_colunas) com
-    base no CONTEÚDO real da coluna -- corrige falsos positivos, como uma
-    coluna numérica qualquer (ex: um índice, uma métrica) que contenha
-    'marca', 'sku' ou 'fabricante' no nome e acabe casando por engano.
+    base no CONTEÚDO real da coluna. Um arquivo real costuma ter várias
+    colunas derivadas com o nome da categoria dentro (ex: N1_DN_MARCA,
+    N1_GIRO_MARCA, Marca_Indice...) além da coluna "de verdade" -- por
+    isso, para cada categoria, escolhemos só UMA coluna representante:
+    a PRIMEIRA (na ordem do arquivo) que não seja numérica. As demais
+    colunas que também casaram pelo nome ficam livres -- não são
+    anonimizadas nem entram em filtro, só aparecem como coluna comum no
+    seletor de colunas do arquivo final.
 
-    Regras:
-    - EAN: numérico é o esperado (é um código numérico por natureza) --
-      todos os candidatos continuam como alvo, sem checagem de conteúdo.
-    - SKU: candidatos NÃO numéricos sempre continuam como alvo. Entre os
-      candidatos NUMÉRICOS, só o primeiro (na ordem em que aparecem no
-      arquivo) é mantido como alvo anonimizável -- os demais deixam de
-      ser tratados como coluna-alvo (viram colunas comuns).
-    - Fornecedor / Marca / Canal / UF: candidatos numéricos são descartados
-      por completo -- não são de fato essa categoria, só têm nome parecido.
+    Exceção: EAN é numérico por natureza, então não passa pela checagem de
+    conteúdo -- só pega a primeira ocorrência mesmo assim.
     """
     nome_para_indice = {info["nome"]: idx for idx, info in COLUNAS_ALVO.items()}
     idx_ean = nome_para_indice["ean"]
-    idx_sku = nome_para_indice["sku"]
 
     candidatos_por_indice = {}
     for col, idx in colunas_candidatas.items():
@@ -321,24 +339,17 @@ def refinar_colunas_por_valor(amostra_df, colunas_candidatas):
 
     for idx, cols in candidatos_por_indice.items():
         if idx == idx_ean:
-            for col in cols:
-                colunas_alvo_final[col] = idx
+            if cols:
+                colunas_alvo_final[cols[0]] = idx
             continue
 
-        numericas, nao_numericas = [], []
         for col in cols:
-            if col in amostra_df.columns and coluna_eh_numerica(amostra_df[col]):
-                numericas.append(col)
-            else:
-                nao_numericas.append(col)
-
-        for col in nao_numericas:
-            colunas_alvo_final[col] = idx
-
-        if idx == idx_sku and numericas:
-            colunas_alvo_final[numericas[0]] = idx
-        # Fornecedor/Marca/Canal/UF numéricas: descartadas por completo
-        # (não entram em colunas_alvo_final).
+            if col in amostra_df.columns and not coluna_eh_numerica(amostra_df[col]):
+                colunas_alvo_final[col] = idx
+                break
+        # Se todas as candidatas forem numéricas, nenhuma "de verdade" foi
+        # encontrada -- não anonimiza nada nessa categoria (mais seguro do
+        # que arriscar escolher a coluna errada).
 
     return colunas_alvo_final
 
@@ -716,8 +727,13 @@ with aba_anonimizar:
         if arquivo is not None:
             st.caption(f"📄 {arquivo.name} — {arquivo.size / 1_048_576:.1f} MB")
 
-            if st.button("🔍 Analisar colunas e valores", key="btn_analisar_anon"):
-                with st.spinner("Lendo colunas e valores únicos das colunas categóricas..."):
+            analise_existente = st.session_state.get("analise_anon")
+            precisa_analisar = (
+                analise_existente is None or analise_existente["arquivo_nome"] != arquivo.name
+            )
+
+            if precisa_analisar:
+                with st.spinner("Analisando colunas e valores..."):
                     if eh_excel(arquivo):
                         encoding_usar = None
                     elif encoding == "Automático":

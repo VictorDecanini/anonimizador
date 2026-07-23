@@ -76,7 +76,37 @@ BASE_INDICE = 10**9  # até 999.999.999 valores únicos por coluna
 # EAN fica de fora por ser numérico por natureza. SKU também não entra
 # quando a coluna escolhida for numérica (pode ser, na prática, o próprio
 # EAN) -- essa checagem extra acontece em analisar_arquivo.
-COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf", "sku", "nivel1"}
+COLUNAS_FILTRAVEIS = {"fornecedor", "marca", "canal", "uf", "nivel1"}
+
+# Colunas que entram como filtro mas NUNCA são anonimizadas (não são dados
+# sensíveis, só ajudam a direcionar a análise). Casamento só por NOME
+# (igual às demais), sem checagem de conteúdo -- por isso é importante que
+# os aliases sejam específicos o suficiente pra não pegar coisa parecida
+# por engano (ex: "data" não deve casar com "periodo").
+FILTROS_EXTRA = {
+    "data": ["data", "date", "dt venda", "data venda", "dt_venda", "data referencia"],
+}
+
+
+def identificar_colunas_filtro_extra(colunas_arquivo, colunas_ja_usadas):
+    """Identifica colunas de filtro que NÃO entram na anonimização (ex:
+    Data). Usa o mesmo casamento por nome (exato ou substring de 4+
+    caracteres) das demais categorias, pegando só a primeira ocorrência de
+    cada uma e ignorando colunas já usadas como categoria-alvo."""
+    encontradas = {}
+    for nome_filtro, aliases in FILTROS_EXTRA.items():
+        aliases_norm = [normalizar_chave(a) for a in aliases]
+        for coluna in colunas_arquivo:
+            if coluna in colunas_ja_usadas or coluna in encontradas:
+                continue
+            col_norm = normalizar_chave(coluna)
+            casou = col_norm in aliases_norm or any(
+                len(a) >= 4 and a in col_norm for a in aliases_norm
+            )
+            if casou:
+                encontradas[coluna] = nome_filtro
+                break  # só a primeira ocorrência dessa categoria extra
+    return encontradas
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +185,7 @@ def carregar_mapa(arquivo_mapa):
     nome_para_indice = {info["nome"]: i for i, info in COLUNAS_ALVO.items()}
 
     if arquivo_mapa is not None:
-        df_mapa = pd.read_csv(arquivo_mapa, dtype=str)
+        df_mapa = pd.read_csv(arquivo_mapa, dtype=str, encoding="utf-8-sig")
         for _, linha in df_mapa.iterrows():
             indice = nome_para_indice.get(linha["coluna"])
             if indice is None:
@@ -257,7 +287,18 @@ def detectar_encoding(arquivo, tamanho_amostra=200_000):
     amostra = arquivo.read(tamanho_amostra)
     arquivo.seek(0)
     resultado = from_bytes(amostra).best()
-    return resultado.encoding if resultado else "utf-8-sig"
+    encoding = resultado.encoding if resultado else "utf-8-sig"
+
+    # ASCII é só um subconjunto de UTF-8: se a AMOSTRA (nem sempre é o
+    # arquivo inteiro) não tinha nenhum caractere acentuado ainda, o
+    # detector pode confiantemente dizer "ascii" mesmo que o resto do
+    # arquivo -- fora da amostra -- tenha acento mais adiante. UTF-8 lê
+    # ASCII perfeitamente também, então é sempre mais seguro promover
+    # ascii -> utf-8 (nunca o contrário).
+    if encoding.lower().replace("-", "").replace("_", "") in ("ascii", "usascii"):
+        encoding = "utf-8"
+
+    return encoding
 
 
 def eh_excel(arquivo):
@@ -407,7 +448,8 @@ def analisar_arquivo(arquivo, sep, encoding):
     arquivo, (2) identificar quais são colunas-alvo -- por nome E por
     conteúdo, para não confundir uma coluna numérica qualquer com uma
     categoria de verdade -- e (3) coletar valores únicos das colunas
-    categóricas filtráveis (fornecedor, marca, canal, uf, sku)."""
+    filtráveis (fornecedor, marca, canal, uf, nivel1 + filtros extras
+    como Data, que não são anonimizados)."""
     amostra_df = ler_amostra_dados(arquivo, sep, encoding)
     colunas_arquivo = list(amostra_df.columns)
 
@@ -425,6 +467,11 @@ def analisar_arquivo(arquivo, sep, encoding):
         if col in amostra_df.columns and coluna_eh_numerica(amostra_df[col]):
             continue
         colunas_filtro[col] = nome
+
+    # Filtros extras (ex: Data) -- não passam pela checagem de conteúdo
+    # numérico porque uma data pode vir em formatos variados; o casamento
+    # por nome específico já evita pegar coisa errada (ex: Periodo).
+    colunas_filtro.update(identificar_colunas_filtro_extra(colunas_arquivo, set(colunas_alvo.keys())))
 
     valores_unicos = {col: set() for col in colunas_filtro}
 
@@ -551,7 +598,7 @@ def processar_desanonimizacao(arquivo, sep, encoding_manual, arquivo_mapa):
         return
 
     tamanho_total = arquivo.size
-    df_mapa = pd.read_csv(arquivo_mapa, dtype=str)
+    df_mapa = pd.read_csv(arquivo_mapa, dtype=str, encoding="utf-8-sig")
     mapa_reverso = {
         coluna: dict(zip(grupo["codigo"].astype(str), grupo["valor_original"]))
         for coluna, grupo in df_mapa.groupby("coluna")
